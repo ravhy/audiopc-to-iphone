@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>PC para iPhone</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background:#000; color:#fff; font-family:-apple-system,system-ui,sans-serif; -webkit-user-select:none; user-select:none; }
+  main { text-align:center; padding:24px; }
+  h1 { font-size:1rem; font-weight:500; letter-spacing:.14em; text-transform:uppercase; color:#fff; opacity:.55; margin:0 0 1.8rem; }
+  #modes { display:inline-flex; border:2px solid #fff; border-radius:999px; overflow:hidden; margin-bottom:1.6rem; }
+  .mode { font-size:.72rem; font-weight:700; letter-spacing:.1em; text-transform:uppercase; padding:.7em 1.15em; background:#000; color:#fff; border:none; touch-action:manipulation; }
+  .mode[aria-selected="true"] { background:#fff; color:#000; }
+  .mode:disabled { opacity:.4; }
+  #hint { margin:0 0 1.8rem; min-height:1.2em; color:#fff; opacity:.5; font-size:.85rem; }
+  #start { font-size:1.4rem; font-weight:700; letter-spacing:.1em; padding:1.1em 2.8em; border:2px solid #fff; border-radius:999px; background:#fff; color:#000; touch-action:manipulation; }
+  #start:disabled { background:#000; color:#fff; opacity:.4; }
+  #status { margin-top:2.2rem; min-height:1.4em; color:#fff; font-size:1rem; }
+  #stats { margin-top:.5rem; min-height:1.2em; color:#fff; opacity:.45; font-size:.85rem; font-variant-numeric:tabular-nums; }
+  .credits { position:fixed; left:50%; bottom:18px; transform:translateX(-50%); margin:0; color:#fff; opacity:.38; font-size:.68rem; font-weight:500; letter-spacing:.08em; white-space:nowrap; }
+</style>
+</head>
+<body>
+<main>
+  <h1>PC para iPhone</h1>
+  <div id="modes" role="tablist">
+    <button class="mode" id="mode-both" role="tab" aria-selected="true">Ambos</button>
+    <button class="mode" id="mode-listen" role="tab" aria-selected="false">Ouvir</button>
+    <button class="mode" id="mode-mic" role="tab" aria-selected="false">Mic</button>
+  </div>
+  <p id="hint"></p>
+  <button id="start">START</button>
+  <p id="status">Aperte START para começar</p>
+  <p id="stats"></p>
+  <audio id="player" autoplay playsinline></audio>
+</main>
+<script>
+"use strict";
+const startBtn = document.getElementById("start");
+const statusEl = document.getElementById("status");
+const statsEl = document.getElementById("stats");
+const hintEl = document.getElementById("hint");
+const player = document.getElementById("player");
+const modeBothBtn = document.getElementById("mode-both");
+const modeListenBtn = document.getElementById("mode-listen");
+const modeMicBtn = document.getElementById("mode-mic");
+let listenPc = null;
+let micPc = null;
+let micStream = null;
+let statsTimer = null;
+let prevListenRtp = null;
+let prevMicRtp = null;
+let mode = "both"; // both | listen | mic
+let started = false;
+
+function setStatus(text) { statusEl.textContent = text; }
+const micSupported = window.isSecureContext && !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+function refreshHint() {
+  if (mode === "both") {
+    hintEl.textContent = micSupported
+      ? "PC audio → iPhone + iPhone microphone → PC."
+      : "Both needs the https:// address for microphone access.";
+  } else if (mode === "listen") {
+    hintEl.textContent = "Play this PC's audio through your iPhone."
+  } else {
+    hintEl.textContent = micSupported
+      ? "Use your iPhone's microphone as a PC input."
+      : "Mic needs the https:// address — reopen this page there.";
+  }
+}
+
+function selectMode(next) {
+  if (started) return;
+  mode = next;
+  modeBothBtn.setAttribute("aria-selected", String(next === "both"));
+  modeListenBtn.setAttribute("aria-selected", String(next === "listen"));
+  modeMicBtn.setAttribute("aria-selected", String(next === "mic"));
+  refreshHint();
+}
+modeBothBtn.addEventListener("click", () => selectMode("both"));
+modeListenBtn.addEventListener("click", () => selectMode("listen"));
+modeMicBtn.addEventListener("click", () => selectMode("mic"));
+
+function stopStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  prevListenRtp = null;
+  prevMicRtp = null;
+  statsEl.textContent = "";
+}
+
+async function updateStats() {
+  const bits = [];
+  if (listenPc && listenPc.connectionState === "connected") {
+    const report = await listenPc.getStats();
+    report.forEach((entry) => {
+      if (entry.type !== "inbound-rtp" || entry.kind !== "audio") return;
+      if (prevListenRtp && entry.jitterBufferDelay !== undefined) {
+        const delay = entry.jitterBufferDelay - prevListenRtp.jitterBufferDelay;
+        const count = entry.jitterBufferEmittedCount - prevListenRtp.jitterBufferEmittedCount;
+        if (count > 0) bits.push("listen buffer " + Math.round((delay / count) * 1000) + " ms");
+      }
+      prevListenRtp = entry;
+    });
+  }
+  if (micPc && micPc.connectionState === "connected") {
+    const report = await micPc.getStats();
+    report.forEach((entry) => {
+      if (entry.type !== "outbound-rtp" || entry.kind !== "audio") return;
+      if (prevMicRtp && entry.packetsSent !== undefined) {
+        bits.push("mic " + (entry.packetsSent - prevMicRtp.packetsSent) + " pkt/s");
+      }
+      prevMicRtp = entry;
+    });
+  }
+  if (bits.length) statsEl.textContent = bits.join(" · ");
+}
+
+function startStats() {
+  stopStats();
+  statsTimer = setInterval(() => { updateStats().catch(() => {}); }, 1000);
+}
+
+function cleanup() {
+  stopStats();
+  if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
+  if (listenPc) { listenPc.close(); listenPc = null; }
+  if (micPc) { micPc.close(); micPc = null; }
+}
+
+function waitForIceGathering(pc) {
+  if (pc.iceGatheringState === "complete") return Promise.resolve();
+  return new Promise((resolve) => {
+    const check = () => {
+      if (pc.iceGatheringState === "complete") {
+        pc.removeEventListener("icegatheringstatechange", check);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", check);
+  });
+}
+
+async function connectListen() {
+  listenPc = new RTCPeerConnection({ iceServers: [] });
+  player.play().catch(() => {});
+  const transceiver = listenPc.addTransceiver("audio", { direction: "recvonly" });
+  try { if ("playoutDelayHint" in transceiver.receiver) transceiver.receiver.playoutDelayHint = 0; } catch (e) {}
+  try { if ("jitterBufferTarget" in transceiver.receiver) transceiver.receiver.jitterBufferTarget = 0; } catch (e) {}
+  listenPc.addEventListener("track", (evt) => {
+    player.srcObject = evt.streams[0];
+    player.play().catch(() => setStatus("Audio blocked — tap Start again"));
+  });
+  listenPc.addEventListener("connectionstatechange", () => {
+    if (listenPc && listenPc.connectionState === "failed") setStatus("Listen connection failed");
+  });
+  await listenPc.setLocalDescription(await listenPc.createOffer());
+  await waitForIceGathering(listenPc);
+  const response = await fetch("/offer", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sdp: listenPc.localDescription.sdp, type: listenPc.localDescription.type }),
+  });
+  if (!response.ok) throw new Error("listen signaling failed (HTTP " + response.status + ")");
+  await listenPc.setRemoteDescription(await response.json());
+}
+
+async function connectMic() {
+  if (!micSupported) throw new Error("mic needs the https:// address");
+  micPc = new RTCPeerConnection({ iceServers: [] });
+  micStream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true },
+  });
+  for (const track of micStream.getAudioTracks()) micPc.addTransceiver(track, { direction: "sendonly" });
+  micPc.addEventListener("connectionstatechange", () => {
+    if (micPc && micPc.connectionState === "failed") setStatus("Mic connection failed");
+  });
+  await micPc.setLocalDescription(await micPc.createOffer());
+  await waitForIceGathering(micPc);
+  const response = await fetch("/mic-offer", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sdp: micPc.localDescription.sdp, type: micPc.localDescription.type }),
+  });
+  if (!response.ok) throw new Error("mic signaling failed (HTTP " + response.status + ")");
+  await micPc.setRemoteDescription(await response.json());
+}
+
+async function start() {
+  startBtn.disabled = true;
+  modeBothBtn.disabled = modeListenBtn.disabled = modeMicBtn.disabled = true;
+  started = true;
+  setStatus("Connecting…");
+  try {
+    if (mode === "both" || mode === "listen") await connectListen();
+    if (mode === "both" || mode === "mic") await connectMic();
+    setStatus(mode === "both"
+      ? "Audio + mic live — keep this page open & screen on"
+      : mode === "listen"
+        ? "Streaming — keep this page open & screen on"
+        : "Mic live — keep this page open & screen on");
+    startStats();
+  } catch (err) {
+    setStatus("Error: " + err.message);
+    cleanup();
+    started = false;
+    startBtn.disabled = false;
+    modeBothBtn.disabled = modeListenBtn.disabled = modeMicBtn.disabled = false;
+  }
+  try { await navigator.wakeLock.request("screen"); } catch (e) {}
+}
+
+startBtn.addEventListener("click", start);
+refreshHint();
+</script>
+  <div class="credits">Feito por Ravhy com ChatGPT</div>
+</body>
+</html>
